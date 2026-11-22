@@ -28,9 +28,9 @@ try {
 } catch {}
 
 # Определение рабочей папки скрипта и каталога логов (всё в 1 папке!)
-$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { "C:\Users\admin\Documents\mic-fix" }
 if ([string]::IsNullOrWhiteSpace($scriptDir) -or -not (Test-Path $scriptDir)) {
-    $scriptDir = "C:\Users\admin\.gemini\antigravity\scratch\mic-fix"
+    $scriptDir = "C:\Users\admin\Documents\mic-fix"
 }
 $logsFolder = Join-Path $scriptDir "logs"
 if (-not (Test-Path $logsFolder)) {
@@ -221,14 +221,14 @@ namespace WinAudioFix
             return info;
         }
 
-        public static bool UnmuteAndSetVolume(string deviceId, float volumeScalar)
+        public static bool UnmuteAndSetVolume(string deviceId, float volumeScalar, int dataFlow)
         {
             try
             {
                 var enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
                 IMMDevice dev;
                 int hr = string.IsNullOrEmpty(deviceId) 
-                    ? enumerator.GetDefaultAudioEndpoint(1, 0, out dev) 
+                    ? enumerator.GetDefaultAudioEndpoint(dataFlow, 0, out dev) 
                     : enumerator.GetDevice(deviceId, out dev);
 
                 if (hr != 0 || dev == null) return false;
@@ -240,12 +240,19 @@ namespace WinAudioFix
                     var epv = (IAudioEndpointVolume)epvObj;
                     Guid empty = Guid.Empty;
                     epv.SetMute(false, ref empty);
-                    epv.SetMasterVolumeLevelScalar(volumeScalar, ref empty);
+                    if (volumeScalar >= 0f) {
+                        epv.SetMasterVolumeLevelScalar(volumeScalar, ref empty);
+                    }
                     return true;
                 }
             }
             catch {}
             return false;
+        }
+
+        public static bool UnmuteAndSetVolume(string deviceId, float volumeScalar)
+        {
+            return UnmuteAndSetVolume(deviceId, volumeScalar, 1);
         }
 
         public static float MeasurePeak(int sampleDurationMs)
@@ -318,31 +325,52 @@ Write-Log "ОС: $([Environment]::OSVersion.VersionString)" "INFO"
 
 $summaryActions = [System.Collections.Generic.List[string]]::new()
 $regCapturePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+$regRenderPath  = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
 
-# ШАГ 1 (15%): Активация точек захвата в реестре MMDevices
-Update-UIProgress -Percent 15 -StepName "Проверка и активация точки микрофона в реестре" -SecondsLeft 7
+# ШАГ 1 (15%): Активация микрофона и динамиков в реестре MMDevices
+Update-UIProgress -Percent 15 -StepName "Проверка и активация аудиоустройств в реестре" -SecondsLeft 7
 Start-Sleep -Milliseconds 400
 
-if ((Test-Path $regCapturePath) -and -not $DiagOnly) {
-    Get-ChildItem $regCapturePath | ForEach-Object {
-        $cKey = $_
-        $cState = (Get-ItemProperty $cKey.PSPath -Name "DeviceState" -ErrorAction SilentlyContinue).DeviceState
-        $cProp = "$($cKey.PSPath)\Properties"
-        $cName = (Get-ItemProperty $cProp -ErrorAction SilentlyContinue).'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
-        
-        if ($cName -like "*Microphone Array*" -or $cName -like "*AMD*" -or $cKey.PSChildName -eq "{52efac22-f9a9-451a-8023-796b5841a409}") {
-            if ($cState -ne 1) {
-                Write-Log "Деактивированный микрофон '$cName' (Код: $cState). Устанавливаю DeviceState = 1..." "INFO"
-                $subKey = "SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\$($cKey.PSChildName)"
-                $regRes = [WinAudioFix.RegHelper]::SetDword($subKey, "DeviceState", 1)
-                if ($regRes -eq 0) {
+if (-not $DiagOnly) {
+    # 1. Активация микрофона
+    if (Test-Path $regCapturePath) {
+        Get-ChildItem $regCapturePath | ForEach-Object {
+            $cKey = $_
+            $cState = (Get-ItemProperty $cKey.PSPath -Name "DeviceState" -ErrorAction SilentlyContinue).DeviceState
+            $cProp = "$($cKey.PSPath)\Properties"
+            $cName = (Get-ItemProperty $cProp -ErrorAction SilentlyContinue).'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
+            
+            if ($cName -like "*Microphone Array*" -or $cName -like "*AMD*" -or $cKey.PSChildName -eq "{52efac22-f9a9-451a-8023-796b5841a409}") {
+                if ($cState -ne 1) {
+                    Write-Log "Деактивированный микрофон '$cName' (Код: $cState). Устанавливаю DeviceState = 1..." "INFO"
+                    $subKey = "SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture\$($cKey.PSChildName)"
+                    [WinAudioFix.RegHelper]::SetDword($subKey, "DeviceState", 1) | Out-Null
                     $summaryActions.Add("Активирован встроенный микрофон '$cName' в реестре (DeviceState = 1).")
                 }
             }
         }
     }
+
+    # 2. Активация динамиков
+    if (Test-Path $regRenderPath) {
+        Get-ChildItem $regRenderPath | ForEach-Object {
+            $rKey = $_
+            $rState = (Get-ItemProperty $rKey.PSPath -Name "DeviceState" -ErrorAction SilentlyContinue).DeviceState
+            $rProp = "$($rKey.PSPath)\Properties"
+            $rName = (Get-ItemProperty $rProp -ErrorAction SilentlyContinue).'{a45c254e-df1c-4efd-8020-67d146a850e0},2'
+            
+            if ($rName -like "*Динамики*" -or $rName -like "*Speakers*" -or $rKey.PSChildName -eq "{fe5d6ab3-f988-483a-a2bf-dcf2c17e5575}") {
+                if ($rState -ne 1) {
+                    Write-Log "Деактивированные динамики '$rName' (Код: $rState). Устанавливаю DeviceState = 1..." "INFO"
+                    $subKey = "SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\$($rKey.PSChildName)"
+                    [WinAudioFix.RegHelper]::SetDword($subKey, "DeviceState", 1) | Out-Null
+                    $summaryActions.Add("Активированы встроенные динамики '$rName' в реестре (DeviceState = 1).")
+                }
+            }
+        }
+    }
 }
-Complete-UIStep "Статус микрофона в реестре Windows проверен и активирован"
+Complete-UIStep "Статус микрофона и динамиков в реестре Windows проверен и активирован"
 
 # ШАГ 2 (40%): Перезапуск аудиослужб Windows и Nahimic
 Update-UIProgress -Percent 40 -StepName "Перезапуск аудиослужб (Audiosrv, Nahimic)" -SecondsLeft 5
